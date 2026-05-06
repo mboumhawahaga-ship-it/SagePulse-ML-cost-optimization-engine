@@ -1,8 +1,8 @@
 # EventBridge Rule - Trigger Step Functions weekly on Monday at 8 UTC
 resource "aws_cloudwatch_event_rule" "ml_cost_analysis_schedule" {
   name                = "${var.project_name}-schedule"
-  description         = "Trigger ML cost analysis every Monday at 8:00 UTC"
-  schedule_expression = "cron(0 8 ? * MON *)"
+  description         = "Trigger ML cost analysis every 4 hours"
+  schedule_expression = "rate(4 hours)"
 
   tags = {
     Project   = var.project_name

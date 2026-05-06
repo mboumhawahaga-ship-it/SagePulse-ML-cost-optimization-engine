@@ -336,167 +336,6 @@ def scan_training_jobs():
         return []
 
 
-def check_eu_ai_act_compliance(endpoint_name):
-    """
-    Vérifie la conformité EU AI Act d'un endpoint SageMaker (modèle en production).
-
-    Tags attendus :
-      - ai-risk-level       : high | limited | minimal
-      - human-oversight     : enabled | disabled
-      - model-purpose       : description du cas d'usage (Art. 13)
-      - conformity-assessment : done | pending | not-required (Art. 9)
-
-    Pénalités EU AI Act :
-      - Jusqu'à 35M€ ou 7% CA mondial pour systèmes haut risque non conformes
-      - Jusqu'à 15M€ ou 3% CA pour autres violations
-
-    Returns:
-        dict: Statut conformité EU AI Act et alertes par article
-    """
-    sm = get_sagemaker_client()
-    alerts = []
-
-    try:
-        region = os.environ.get("AWS_REGION", "eu-west-1")
-        arn = f"arn:aws:sagemaker:{region}:{get_account_id()}:endpoint/{endpoint_name}"
-        tags_response = sm.list_tags(ResourceArn=arn)
-        tags = {t["Key"]: t["Value"] for t in tags_response.get("Tags", [])}
-
-        ai_risk = tags.get("ai-risk-level", "unknown")
-
-        # Art. 9 — classification du risque obligatoire
-        if ai_risk == "unknown":
-            alerts.append("[Art. 9] Tag 'ai-risk-level' manquant — risque non classifié")
-
-        # Art. 14 — supervision humaine obligatoire pour les systèmes haut risque
-        if ai_risk == "high" and tags.get("human-oversight") != "enabled":
-            alerts.append("[Art. 14] Modèle haut risque sans human-oversight: enabled — pénalité jusqu'à 35M€")
-
-        # Art. 9 — évaluation de conformité requise pour haut risque
-        if ai_risk == "high" and "conformity-assessment" not in tags:
-            alerts.append("[Art. 9] Tag 'conformity-assessment' manquant sur modèle haut risque")
-
-        # Art. 13 — transparence et documentation du cas d'usage
-        if "model-purpose" not in tags:
-            alerts.append("[Art. 13] Tag 'model-purpose' manquant — cas d'usage non documenté")
-
-        if not alerts:
-            alerts.append("Conforme EU AI Act")
-
-    except ClientError:
-        alerts.append("Impossible de vérifier les tags EU AI Act")
-        ai_risk = "unknown"
-
-    return {
-        "endpoint": endpoint_name,
-        "ai_risk_level": ai_risk,
-        "human_oversight": tags.get("human-oversight", "not-set") if "tags" in dir() else "unknown",
-        "alerts": alerts,
-        "compliant": not alerts or (len(alerts) == 1 and "Conforme" in alerts[0]),
-    }
-
-
-def _build_eu_ai_act_compliance(endpoints):
-    """Évalue la conformité EU AI Act sur tous les endpoints."""
-    if not endpoints:
-        return {"endpoints": [], "global_status": "N/A", "high_risk_count": 0}
-
-    results = [check_eu_ai_act_compliance(e["name"]) for e in endpoints]
-
-    high_risk_non_compliant = [r for r in results if r["ai_risk_level"] == "high" and not r["compliant"]]
-    unknown_risk = [r for r in results if r["ai_risk_level"] == "unknown"]
-
-    if high_risk_non_compliant:
-        global_status = "Non-Compliant"
-    elif unknown_risk:
-        global_status = "Incomplete"
-    else:
-        global_status = "Compliant"
-
-    logger.info(f"✅ EU AI Act scan : {len(results)} endpoints, statut global = {global_status}")
-    return {
-        "endpoints": results,
-        "global_status": global_status,
-        "high_risk_count": len([r for r in results if r["ai_risk_level"] == "high"]),
-    }
-
-
-def check_rgpd_compliance(resource_name, resource_type):
-    """
-    Vérifie la conformité RGPD basique d'une ressource.
-    Retourne les alertes et le niveau de risque.
-
-    Args:
-        resource_name: Nom de la ressource
-        resource_type: Type (notebook, endpoint, training)
-
-    Returns:
-        dict: Statut conformité et alertes
-    """
-    sm = get_sagemaker_client()
-    alerts = []
-    risk_level = "Low"
-
-    try:
-        # Vérifie les tags de la ressource
-        arn = f"arn:aws:sagemaker:{os.environ.get('AWS_REGION', 'eu-west-1')}:{get_account_id()}:{resource_type}/{resource_name}"
-        tags_response = sm.list_tags(ResourceArn=arn)
-        tags = {t["Key"]: t["Value"] for t in tags_response.get("Tags", [])}
-
-        # Vérifie les tags obligatoires RGPD
-        if "owner" not in tags:
-            alerts.append("⚠️ Tag 'owner' manquant → responsable inconnu")
-            risk_level = "Medium"
-
-        if "data-classification" not in tags:
-            alerts.append(
-                "⚠️ Tag 'data-classification' manquant → données non classifiées"
-            )
-            risk_level = "Medium"
-
-        if "expiration-date" not in tags:
-            alerts.append(
-                "⚠️ Tag 'expiration-date' manquant → pas de durée de rétention"
-            )
-            risk_level = "High"
-
-        if not alerts:
-            alerts.append("✅ Tags RGPD conformes")
-
-    except ClientError:
-        alerts.append("⚠️ Impossible de vérifier les tags")
-        risk_level = "Unknown"
-
-    return {
-        "resource": resource_name,
-        "type": resource_type,
-        "rgpd_risk": risk_level,
-        "alerts": alerts,
-    }
-
-
-def _build_rgpd_compliance(notebooks, endpoints):
-    """Calcule la conformité RGPD une seule fois et détermine le risque global."""
-    nb_results = [
-        check_rgpd_compliance(n["name"], "notebook-instance") for n in notebooks
-    ]
-    ep_results = [check_rgpd_compliance(e["name"], "endpoint") for e in endpoints]
-    all_results = nb_results + ep_results
-
-    if any(r["rgpd_risk"] == "High" for r in all_results):
-        global_risk = "High"
-    elif any(r["rgpd_risk"] == "Medium" for r in all_results):
-        global_risk = "Medium"
-    else:
-        global_risk = "Low"
-
-    return {
-        "notebooks": nb_results,
-        "endpoints": ep_results,
-        "global_risk": global_risk,
-    }
-
-
 def calculate_carbon_footprint(instance_type):
     """
     Retourne une estimation de l'empreinte carbone en kg CO² par mois
@@ -521,9 +360,6 @@ def run_discovery():
     """
     Point d'entrée principal : scanne toutes les ressources
     SageMaker et retourne un rapport complet.
-
-    Returns:
-        dict: Rapport complet avec toutes les ressources
     """
     logger.info("🔍 Démarrage du scan SageMaker...")
 
@@ -551,8 +387,6 @@ def run_discovery():
         "studio_apps": studio_apps,
         "endpoints": endpoints,
         "training_jobs": training_jobs,
-        "rgpd_compliance": _build_rgpd_compliance(notebooks, endpoints),
-        "eu_ai_act_compliance": _build_eu_ai_act_compliance(endpoints),
     }
 
     logger.info(
@@ -565,7 +399,6 @@ def run_discovery():
 
 if __name__ == "__main__":
     # Test local
-    os.environ["AWS_REGION"] = "eu-west-1"
     result = run_discovery()
     import json
 

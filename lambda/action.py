@@ -17,15 +17,15 @@ def get_sagemaker_client():
     )
 
 
+def get_sns_client():
+    return boto3.client(
+        "sns", region_name=os.environ.get("AWS_REGION", "eu-west-1")
+    )
+
+
 def stop_notebook(notebook_name):
     """
     Arrête un notebook SageMaker (stop uniquement, pas de suppression).
-
-    Args:
-        notebook_name (str): Nom du notebook à arrêter
-
-    Returns:
-        dict: Résultat de l'action avec statut et timestamp
     """
     timestamp = datetime.now(timezone.utc).isoformat()
     try:
@@ -50,33 +50,48 @@ def stop_notebook(notebook_name):
         }
 
 
-def delete_endpoint(endpoint_name):
+def notify_idle_endpoint(endpoint_name):
     """
-    Supprime un endpoint SageMaker inactif.
-
-    Args:
-        endpoint_name (str): Nom de l'endpoint à supprimer
-
-    Returns:
-        dict: Résultat de l'action avec statut et timestamp
+    Envoie une notification SNS pour un endpoint idle.
+    Aucune suppression — la décision appartient aux MLOps.
     """
     timestamp = datetime.now(timezone.utc).isoformat()
-    try:
-        get_sagemaker_client().delete_endpoint(EndpointName=endpoint_name)
-        logger.info(f"✅ [{timestamp}] Endpoint supprimé : {endpoint_name}")
+    sns_topic_arn = os.environ.get("SNS_TOPIC_ARN")
+
+    if not sns_topic_arn:
+        logger.warning(f"⚠️ SNS_TOPIC_ARN non configuré, notification ignorée pour {endpoint_name}")
         return {
             "resource": endpoint_name,
-            "action": "delete_endpoint",
-            "status": "success",
+            "action": "notify_idle_endpoint",
+            "status": "skipped",
+            "timestamp": timestamp,
+        }
+
+    try:
+        get_sns_client().publish(
+            TopicArn=sns_topic_arn,
+            Subject=f"[SagePulse] Endpoint idle détecté : {endpoint_name}",
+            Message=(
+                f"L'endpoint '{endpoint_name}' n'a reçu aucune invocation depuis 4h.\n\n"
+                f"Actions possibles :\n"
+                f"  - Supprimer manuellement si le modèle n'est plus nécessaire\n"
+                f"  - Configurer un auto-scaling avec minimum 0 instance\n"
+                f"  - Conserver si des pics de trafic sont attendus\n\n"
+                f"Timestamp : {timestamp}"
+            ),
+        )
+        logger.info(f"✅ [{timestamp}] Notification envoyée pour endpoint idle : {endpoint_name}")
+        return {
+            "resource": endpoint_name,
+            "action": "notify_idle_endpoint",
+            "status": "notified",
             "timestamp": timestamp,
         }
     except ClientError as e:
-        logger.error(
-            f"❌ [{timestamp}] Échec suppression endpoint {endpoint_name} : {e}"
-        )
+        logger.error(f"❌ [{timestamp}] Échec notification endpoint {endpoint_name} : {e}")
         return {
             "resource": endpoint_name,
-            "action": "delete_endpoint",
+            "action": "notify_idle_endpoint",
             "status": "error",
             "error": str(e),
             "timestamp": timestamp,
@@ -122,9 +137,9 @@ def handler(event, context):
         for name in notebooks:
             results.append(stop_notebook(name))
         for name in endpoints:
-            results.append(delete_endpoint(name))
+            results.append(notify_idle_endpoint(name))
 
-        success_count = sum(1 for r in results if r["status"] == "success")
+        success_count = sum(1 for r in results if r["status"] in ("success", "notified"))
         logger.info(f"✅ {success_count}/{len(results)} actions réussies")
 
         return {

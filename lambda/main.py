@@ -283,8 +283,6 @@ def generate_markdown_report(
     savings_pct,
     recs,
     report_date,
-    rgpd_data=None,
-    eu_ai_act_data=None,
 ):
     """
     Génère un rapport Markdown avec résumé exécutif et recommandations.
@@ -337,57 +335,6 @@ def generate_markdown_report(
         markdown += f"{idx}. **{rec['type']}** - {rec['issue']}\n"
         markdown += f"   - Potential Savings: ${rec['savings']:,.2f}/month\n"
         markdown += f"   - Effort: {rec['effort']} | Priority: {rec['priority']}\n\n"
-
-    # Section RGPD
-    if rgpd_data:
-        risk = rgpd_data.get("global_risk", "Unknown")
-        risk_emoji = {"Low": "✅", "Medium": "⚠️", "High": "🔴", "Unknown": "❓"}.get(
-            risk, "❓"
-        )
-        markdown += "\n---\n\n## GDPR Compliance\n\n"
-        markdown += f"**Global Risk Level: {risk_emoji} {risk}**\n\n"
-
-        all_resources = rgpd_data.get("notebooks", []) + rgpd_data.get("endpoints", [])
-        non_compliant = [r for r in all_resources if r["rgpd_risk"] != "Low"]
-
-        if non_compliant:
-            markdown += "| Resource | Type | Risk | Alerts |\n"
-            markdown += "|----------|------|------|--------|\n"
-            for r in non_compliant:
-                alerts = " / ".join(r["alerts"])
-                markdown += (
-                    f"| {r['resource']} | {r['type']} | {r['rgpd_risk']} | {alerts} |\n"
-                )
-        else:
-            markdown += "All scanned resources have compliant GDPR tags.\n"
-
-    # Section EU AI Act
-    if eu_ai_act_data and eu_ai_act_data.get("endpoints"):
-        status = eu_ai_act_data.get("global_status", "N/A")
-        status_emoji = {
-            "Compliant": "✅",
-            "Incomplete": "⚠️",
-            "Non-Compliant": "🔴",
-            "N/A": "—",
-        }.get(status, "❓")
-        high_risk = eu_ai_act_data.get("high_risk_count", 0)
-
-        markdown += "\n---\n\n## EU AI Act Compliance\n\n"
-        markdown += f"**Global Status: {status_emoji} {status}**"
-        if high_risk > 0:
-            markdown += f" | **High-Risk Models: {high_risk}**"
-        markdown += "\n\n"
-        markdown += "> Penalties up to \u20ac35M or 7% of global turnover for non-compliant high-risk AI systems.\n\n"
-
-        non_compliant = [r for r in eu_ai_act_data["endpoints"] if not r["compliant"]]
-        if non_compliant:
-            markdown += "| Endpoint | Risk Level | Human Oversight | Alerts |\n"
-            markdown += "|----------|------------|-----------------|--------|\n"
-            for r in non_compliant:
-                alerts = " / ".join(r["alerts"])
-                markdown += f"| {r['endpoint']} | {r['ai_risk_level']} | {r['human_oversight']} | {alerts} |\n"
-        else:
-            markdown += "All endpoints are EU AI Act compliant.\n"
 
     return markdown
 
@@ -515,8 +462,6 @@ def send_sns_notification(
     savings_pct,
     recommendation_count,
     markdown_s3_url,
-    rgpd_risk=None,
-    eu_ai_act_status=None,
 ):
     """
     Envoie une notification SNS avec un résumé des économies identifiées.
@@ -533,20 +478,8 @@ def send_sns_notification(
         message = (
             f"ML Cost Analysis — ${total_savings:,.2f} identified in savings "
             f"({savings_pct}%) across {recommendation_count} recommendations.\n\n"
+            f"Full report: {markdown_s3_url}"
         )
-        if rgpd_risk:
-            risk_emoji = {"Low": "✅", "Medium": "⚠️", "High": "🔴"}.get(rgpd_risk, "❓")
-            message += f"GDPR Risk: {risk_emoji} {rgpd_risk}\n"
-        if eu_ai_act_status:
-            status_emoji = {
-                "Compliant": "✅",
-                "Incomplete": "⚠️",
-                "Non-Compliant": "🔴",
-            }.get(eu_ai_act_status, "❓")
-            message += f"EU AI Act: {status_emoji} {eu_ai_act_status}\n"
-        if rgpd_risk or eu_ai_act_status:
-            message += "\n"
-        message += f"Full report: {markdown_s3_url}"
 
         response = get_sns_client().publish(
             TopicArn=sns_topic_arn,
@@ -564,20 +497,11 @@ def send_sns_notification(
 
 def get_real_costs():
     """
-    Récupère les coûts SageMaker réels via Cost Explorer.
-    Retourne la même structure que MOCK_DATA.
-
-    Note: Cost Explorer peut nécessiter jusqu'à 24h après activation
-    avant de retourner des données. En cas d'absence de données ou
-    d'erreur, retourne MOCK_DATA comme fallback avec un avertissement.
-
-    Returns:
-        dict: {"total_cost": float, "cost_by_resource": {...}}
+    Récupère les coûts SageMaker réels via Cost Explorer groupés par USAGE_TYPE.
+    Permet d'obtenir les coûts réels par type de ressource (notebook, endpoint, training).
     """
     try:
         today = date.today()
-        # Cost Explorer requiert start != end — on prend le mois courant
-        # Si on est le 1er du mois, on recule d'un mois pour éviter start == end
         start_date = today.replace(day=1)
         if start_date == today:
             prev_month = today.replace(day=1) - __import__("datetime").timedelta(days=1)
@@ -590,82 +514,70 @@ def get_real_costs():
             TimePeriod={"Start": start, "End": end},
             Granularity="MONTHLY",
             Filter={"Dimensions": {"Key": "SERVICE", "Values": ["Amazon SageMaker"]}},
-            GroupBy=[{"Type": "DIMENSION", "Key": "SERVICE"}],
+            GroupBy=[{"Type": "DIMENSION", "Key": "USAGE_TYPE"}],
             Metrics=["UnblendedCost"],
         )
 
         results = response.get("ResultsByTime", [])
         if not results:
-            logger.info(
-                "ℹ️ Cost Explorer : aucun résultat — pas encore de dépenses SageMaker ce mois-ci."
-            )
+            logger.info("ℹ️ Cost Explorer : aucun résultat ce mois-ci.")
             return {
                 "total_cost": 0.0,
                 "cost_by_resource": {
-                    "notebooks": 0.0,
-                    "training": 0.0,
-                    "endpoints": 0.0,
-                    "storage": 0.0,
-                    "other": 0.0,
+                    "notebooks": 0.0, "training": 0.0, "endpoints": 0.0,
+                    "storage": 0.0, "other": 0.0,
                 },
                 "cost_explorer_available": True,
             }
 
-        total_cost = sum(
-            float(group["Metrics"]["UnblendedCost"]["Amount"])
-            for result in results
-            for group in result.get("Groups", [])
-        )
+        cost_by_resource = {
+            "notebooks": 0.0, "training": 0.0, "endpoints": 0.0,
+            "storage": 0.0, "other": 0.0,
+        }
+
+        for result in results:
+            for group in result.get("Groups", []):
+                usage_type = group["Keys"][0].lower()
+                amount = float(group["Metrics"]["UnblendedCost"]["Amount"])
+                if "notebook" in usage_type:
+                    cost_by_resource["notebooks"] += amount
+                elif "training" in usage_type:
+                    cost_by_resource["training"] += amount
+                elif "endpoint" in usage_type or "inference" in usage_type:
+                    cost_by_resource["endpoints"] += amount
+                elif "storage" in usage_type or "s3" in usage_type:
+                    cost_by_resource["storage"] += amount
+                else:
+                    cost_by_resource["other"] += amount
+
+        cost_by_resource = {k: round(v, 2) for k, v in cost_by_resource.items()}
+        total_cost = round(sum(cost_by_resource.values()), 2)
 
         if total_cost == 0:
-            logger.info(
-                "ℹ️ Cost Explorer : coût SageMaker = $0 ce mois-ci "
-                "(pas encore de dépenses ou délai 24h)."
-            )
+            logger.info("ℹ️ Cost Explorer : coût SageMaker = $0 ce mois-ci.")
             return {
                 "total_cost": 0.0,
                 "cost_by_resource": {
-                    "notebooks": 0.0,
-                    "training": 0.0,
-                    "endpoints": 0.0,
-                    "storage": 0.0,
-                    "other": 0.0,
+                    "notebooks": 0.0, "training": 0.0, "endpoints": 0.0,
+                    "storage": 0.0, "other": 0.0,
                 },
                 "cost_explorer_available": True,
             }
 
-        # Répartition estimée par type de ressource (proportions SageMaker typiques)
-        cost_by_resource = {
-            "notebooks": round(total_cost * 0.25, 2),
-            "training": round(total_cost * 0.35, 2),
-            "endpoints": round(total_cost * 0.20, 2),
-            "storage": round(total_cost * 0.05, 2),
-            "other": round(total_cost * 0.15, 2),
-        }
-
-        logger.info(f"✅ Cost Explorer : coût SageMaker du mois = ${total_cost:,.2f}")
-        return {
-            "total_cost": round(total_cost, 2),
-            "cost_by_resource": cost_by_resource,
-        }
+        logger.info(f"✅ Cost Explorer : coût SageMaker = ${total_cost:,.2f} (répartition réelle par USAGE_TYPE)")
+        return {"total_cost": total_cost, "cost_by_resource": cost_by_resource}
 
     except ClientError as e:
         error_code = e.response["Error"]["Code"]
         if error_code in ("DataUnavailableException", "RequestExpiredException"):
-            logger.warning(
-                f"⚠️ Cost Explorer non disponible ({error_code}) — "
-                "données pas encore prêtes (délai 24h)."
-            )
+            logger.warning(f"⚠️ Cost Explorer non disponible ({error_code}).")
         else:
             logger.error(f"❌ Erreur Cost Explorer : {e}.")
         return {
             "total_cost": 0.0,
             "cost_by_resource": {
-                "notebooks": 0.0,
-                "training": 0.0,
-                "endpoints": 0.0,
-                "storage": 0.0,
-                "other": 0.0,
+                "notebooks": 0.0, "training": 0.0, "endpoints": 0.0,
+                "storage": 0.0, "other": 0.0,
             },
             "cost_explorer_available": False,
         }
@@ -698,16 +610,12 @@ def handler(event, context):
         if mock_mode:
             logger.info("📊 Using mock data (MOCK_MODE=true)")
             data = MOCK_DATA
-            rgpd_data = None
-            eu_ai_act_data = None
         else:
             logger.info("📊 Fetching real costs from Cost Explorer...")
             data = get_real_costs()
             logger.info("🔍 Scanning real SageMaker resources...")
             discovery = run_discovery()
             data["discovery"] = discovery
-            rgpd_data = discovery.get("rgpd_compliance")
-            eu_ai_act_data = discovery.get("eu_ai_act_compliance")
 
             # Si Cost Explorer retourne $0, on calcule depuis les ressources réelles
             if data["total_cost"] == 0.0:
@@ -758,8 +666,6 @@ def handler(event, context):
                 savings_pct,
                 recs,
                 report_date,
-                rgpd_data,
-                eu_ai_act_data,
             )
             markdown_url = save_markdown_report(
                 report_bucket, markdown_content, report_date
@@ -773,8 +679,6 @@ def handler(event, context):
                     savings_pct,
                     len(recs),
                     markdown_url,
-                    rgpd_data.get("global_risk") if rgpd_data else None,
-                    eu_ai_act_data.get("global_status") if eu_ai_act_data else None,
                 )
             else:
                 logger.warning(
@@ -796,19 +700,8 @@ def handler(event, context):
                     if e.get("is_idle") and e.get("is_running")
                 ]
             )
-            # Compliance score : % de ressources sans alerte RGPD High
-            all_rgpd = []
-            if rgpd_data:
-                all_rgpd = rgpd_data.get("notebooks", []) + rgpd_data.get(
-                    "endpoints", []
-                )
-            compliant_count = sum(1 for r in all_rgpd if r.get("rgpd_risk") == "Low")
-            compliance_score = (
-                round(compliant_count / len(all_rgpd) * 100) if all_rgpd else 100.0
-            )
-
             publish_metrics(
-                total_savings, idle_notebooks, idle_endpoints, compliance_score
+                total_savings, idle_notebooks, idle_endpoints, 100.0
             )
         else:
             logger.info("⏭️  Skipping S3 uploads and SNS in MOCK_MODE")
