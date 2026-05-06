@@ -129,9 +129,16 @@ Pourquoi l'hebdomadaire ne suffit pas : SageMaker facture à l'heure. Un noteboo
 
 ### Plan v2
 - [ ] Séparer en 3 Lambdas : `cost_scanner` / `cost_calculator` / `cost_action`
-- [ ] Passer EventBridge de hebdomadaire à toutes les 4h
+- [x] Passer EventBridge de hebdomadaire à toutes les 4h
 - [ ] Ajouter alerte SNS immédiate si seuil dépassé (configurable)
 - [ ] Ajouter DynamoDB pour l'historique des scans et actions
+
+### Changements v2 — commit 0585c81
+- RGPD et EU AI Act retirés de `discovery.py`
+- `delete_endpoint` remplacé par `notify_idle_endpoint` dans `action.py` (SNS only, pas de suppression)
+- `get_real_costs()` utilise maintenant `USAGE_TYPE` — vrais chiffres Cost Explorer
+- EventBridge passé à `rate(4 hours)`
+- 63 tests passent
 
 ---
 
