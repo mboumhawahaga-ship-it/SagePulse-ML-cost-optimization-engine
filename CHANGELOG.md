@@ -133,6 +133,12 @@ Pourquoi l'hebdomadaire ne suffit pas : SageMaker facture à l'heure. Un noteboo
 - [ ] Ajouter alerte SNS immédiate si seuil dépassé (configurable)
 - [ ] Ajouter DynamoDB pour l'historique des scans et actions
 
+### Réflexions ouvertes
+
+**Alert fatigue** — si quelqu'un branche l'outil sur un vrai workload avec 50 ressources, il va recevoir 50 notifications d'un coup et ne saura plus quoi traiter en premier. Solution envisagée : seuils configurables (`COST_ALERT_THRESHOLD`, `IDLE_HOURS_THRESHOLD`) + regrouper toutes les alertes en 1 seul message Slack toutes les 4h avec les ressources triées par coût. 1 message = 1 décision.
+
+---
+
 ### Prochaines décisions — en cours
 
 | Changement | Pourquoi |
