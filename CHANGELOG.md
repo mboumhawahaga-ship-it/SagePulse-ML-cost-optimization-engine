@@ -146,6 +146,7 @@ Pourquoi l'hebdomadaire ne suffit pas : SageMaker facture à l'heure. Un noteboo
 | `scan_studio_apps()` + `delete_app()` | Les KernelGateway sont facturés à l'heure. Safe à supprimer — fichiers sur EFS, l'app se recrée à la prochaine connexion |
 | `save_to_dynamodb()` dans main.py | Logguer chaque ressource idle (ResourceID, Status, Cost, AlertSent, Timestamp) — les MLOps ont un historique sans attendre le rapport hebdo |
 | Endpoints + training jobs → waitForTaskToken | Stop notebook est safe. Endpoint et training job sont risqués — validation humaine obligatoire avant d'agir |
+| **DynamoDB** — historique + déduplication alertes | Évite l'alert fatigue : avant d'envoyer un message Slack, SagePulse vérifie si la ressource a déjà été alertée. Permissions strictes : `PutItem` + `GetItem` + `Query` uniquement sur la table dédiée. Jamais `Scan` ni `DeleteTable`. |
 
 ### Changements v2 — commit 0585c81
 - RGPD et EU AI Act retirés de `discovery.py`
