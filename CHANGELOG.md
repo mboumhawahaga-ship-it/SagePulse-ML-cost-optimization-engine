@@ -131,7 +131,7 @@ Pourquoi l'hebdomadaire ne suffit pas : SageMaker facture à l'heure. Un noteboo
 - [ ] Séparer en 3 Lambdas : `cost_scanner` / `cost_calculator` / `cost_action`
 - [x] Passer EventBridge de hebdomadaire à toutes les 4h
 - [ ] Ajouter alerte SNS immédiate si seuil dépassé (configurable)
-- [ ] Ajouter DynamoDB pour l'historique des scans et actions
+- [x] Ajouter DynamoDB pour l'historique des scans et déduplication alertes
 
 ### Réflexions ouvertes
 
@@ -147,6 +147,14 @@ Pourquoi l'hebdomadaire ne suffit pas : SageMaker facture à l'heure. Un noteboo
 | `save_to_dynamodb()` dans main.py | Logguer chaque ressource idle (ResourceID, Status, Cost, AlertSent, Timestamp) — les MLOps ont un historique sans attendre le rapport hebdo |
 | Endpoints + training jobs → waitForTaskToken | Stop notebook est safe. Endpoint et training job sont risqués — validation humaine obligatoire avant d'agir |
 | **DynamoDB** — historique + déduplication alertes | Évite l'alert fatigue : avant d'envoyer un message Slack, SagePulse vérifie si la ressource a déjà été alertée. Permissions strictes : `PutItem` + `GetItem` + `Query` uniquement sur la table dédiée. Jamais `Scan` ni `DeleteTable`. Intégré dans le handler : après le scan, pour chaque ressource idle → vérifier DynamoDB → si pas encore alerté : envoyer SNS + écrire dans DynamoDB. Si déjà alerté : ne rien envoyer. |
+
+### DynamoDB intégré
+- Table `ml-cost-optimizer-idle-resources` — PAY_PER_REQUEST, TTL 90 jours
+- IAM strict : `PutItem` + `GetItem` + `Query` uniquement, pas de `Scan` ni `DeleteTable`
+- `save_to_dynamodb()` — enregistre chaque ressource idle, non-bloquant
+- `alert_already_sent()` — vérifie si alerte envoyée dans les 4 dernières heures
+- Handler mis à jour : SNS uniquement si pas encore alerté
+- 7 nouveaux tests
 
 ### Changements v2 — commit 0585c81
 - RGPD et EU AI Act retirés de `discovery.py`
