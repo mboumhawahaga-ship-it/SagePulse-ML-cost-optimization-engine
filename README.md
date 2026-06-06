@@ -157,10 +157,12 @@ Each resource is evaluated using:
 
 SagePulse enables:
 
-- up to **40% reduction** in SageMaker development costs
+- up to **40% reduction** in SageMaker development costs by detecting underutilized ML resources every 4 hours
 - elimination of unnoticed idle ML workloads
 - improved accountability in MLOps environments
-- faster detection of cost anomalies
+- near real-time (4h interval) detection of idle notebooks and endpoints
+
+> **Estimated impact:** Reduces up to 40% of idle SageMaker development costs. Improves resource utilization visibility with near real-time detection of idle notebooks, endpoints, and stuck training jobs.
 
 ---
 
