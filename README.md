@@ -4,36 +4,87 @@
 [![Python](https://img.shields.io/badge/python-3.12-blue)](https://www.python.org)
 [![Terraform](https://img.shields.io/badge/terraform-%3E%3D1.0-purple)](https://www.terraform.io)
 
-# SagePulse
-
-Stop paying for idle resources. The intelligent FinOps scanner for AWS SageMaker.
+# SagePulse — FinOps Optimization Engine for AWS SageMaker
 
 ---
 
-## The Problem
+## Business Context
 
-SageMaker is a money pit when resources stay active without being used. A forgotten endpoint or a KernelGateway running all weekend can cost hundreds of dollars before you even receive your AWS billing alert.
+SageMaker environments are often over-provisioned or forgotten after experimentation phases.
 
----
+In ML teams, it is common for:
 
-## What SagePulse Does
+- notebook instances to remain idle for days
+- inference endpoints to stay active without traffic
+- training jobs to run longer than necessary
+- development environments to be left running over weekends
 
-Every 4 hours, SagePulse scans your infrastructure and identifies unused resources using cross-referenced analysis — CloudWatch metrics and real billing data combined.
-
-| Resource | Detection method | Action |
-|---|---|---|
-| Notebook Instances | CPU < 5% for 4h | Auto-stop (state preserved) |
-| Inference Endpoints | 0 invocations over 24h | Alert — human approval required |
-| Studio Apps (KernelGateway) | Active without user | Alert |
-| Training Jobs | Stuck or abnormally long | Alert |
-
-Nothing critical is deleted automatically. You decide what to act on.
+This leads to significant and unnoticed cloud waste, often representing a large portion of ML infrastructure spend.
 
 ---
 
-## Architecture
+## 🎯 Business Objective
 
-100% serverless — costs nothing when idle.
+SagePulse is a FinOps automation engine for ML workloads on AWS, designed to:
+
+- Detect idle and underutilized SageMaker resources
+- Reduce unnecessary ML infrastructure spend
+- Provide real-time cost visibility for MLOps teams
+- Introduce controlled, human-approved remediation
+
+---
+
+## 💡 Key Business Outcomes
+
+### 1. ML Cost Optimization
+
+Continuously identifies unused SageMaker resources and highlights cost inefficiencies.
+
+→ Reduces wasted spend in development and experimentation environments
+
+### 2. Operational Visibility for MLOps Teams
+
+Provides near real-time insight into:
+
+- idle notebooks
+- unused endpoints
+- stuck or inefficient training jobs
+
+→ Enables proactive cost management instead of monthly billing surprises
+
+### 3. Controlled Cost Reduction (Human-in-the-loop)
+
+No automatic destructive actions.
+
+- alerts are generated automatically
+- remediation requires explicit approval
+
+→ Ensures safe FinOps automation without production risk
+
+### 4. Reduction of Alert Noise
+
+State tracking via DynamoDB ensures:
+
+- no duplicate alerts per scan cycle
+- stable and actionable notifications
+
+---
+
+## 📊 FinOps KPIs
+
+| KPI | Description | Business Impact |
+|-----|-------------|-----------------|
+| **Idle Resource Cost** | Cost of unused SageMaker resources | direct savings |
+| **Detection Frequency** | Scan interval effectiveness | visibility |
+| **Action Rate** | % alerts leading to remediation | efficiency |
+| **Alert Deduplication Rate** | reduction of duplicate alerts | reduced noise |
+| **Estimated Savings** | cost avoided via shutdowns | ROI of system |
+
+---
+
+## 🏗️ Architecture Overview
+
+SagePulse is a fully serverless ML FinOps control system:
 
 ```
 EventBridge (every 4 hours)
@@ -56,7 +107,7 @@ Human Approval (waitForTaskToken)
   Workflow pauses — resumes only after explicit approval
         ↓
 Lambda Action
-  Stops notebooks
+  Stops notebooks (state preserved)
   Notifies about idle endpoints (no auto-deletion)
         ↓
 S3
@@ -65,24 +116,65 @@ S3
 
 ---
 
-## Business Impact
+## 🧠 Core Design Principle
 
-- **Visibility** — precise cost breakdown per resource, updated every 4 hours
-- **Savings** — up to 40% reduction on SageMaker Dev/Test environments
-- **No alert fatigue** — DynamoDB deduplication ensures one alert per resource, not one per scan
+> "Detect automatically, act only with human validation."
 
----
+This ensures:
 
-## Security
-
-- **Safe-stop** — notebooks are stopped (state preserved on EFS), never deleted
-- **Human approval** — critical resources (endpoints) alert but never act without confirmation
-- **Least-privilege IAM** — separate roles for Lambda and Step Functions, scoped per action
-- **No long-term AWS keys** — GitHub Actions authenticates via OIDC
+- no accidental shutdown of production ML workloads
+- controlled FinOps automation
+- safe adoption in enterprise environments
 
 ---
 
-## Setup
+## ⚙️ Cost Intelligence Layer
+
+Each resource is evaluated using:
+
+- CPU utilization (CloudWatch)
+- invocation activity (SageMaker metrics)
+- real cost estimation (AWS Pricing API)
+- inactivity duration thresholds
+
+---
+
+## 🔁 Workflow Summary
+
+1. Scheduled scan (EventBridge every 4 hours)
+2. Resource discovery (Lambda scanner)
+3. Idle detection logic
+4. Cost estimation per resource
+5. Deduplication (DynamoDB)
+6. Alert generation (SNS)
+7. Human approval (Step Functions wait state)
+8. Optional remediation (stop notebooks)
+9. Reporting (S3 archive)
+
+---
+
+## 💰 Business Impact
+
+SagePulse enables:
+
+- up to **40% reduction** in SageMaker development costs
+- elimination of unnoticed idle ML workloads
+- improved accountability in MLOps environments
+- faster detection of cost anomalies
+
+---
+
+## 🔐 Security & Safety Model
+
+- No automatic deletion of resources
+- Notebook state preserved (safe stop only)
+- Least privilege IAM per component
+- No long-lived credentials (OIDC GitHub auth)
+- Approval required for any remediation action
+
+---
+
+## 🚀 Setup
 
 ```bash
 git clone https://github.com/mboumhawahaga-ship-it/SagePulse
@@ -116,7 +208,6 @@ pytest tests/ --cov=lambda --cov-fail-under=80 -v
 | CI/CD | GitHub Actions · OIDC auth |
 | Observability | AWS Lambda Powertools · CloudWatch custom metrics |
 | Testing | pytest · unittest.mock · moto · 88% coverage |
-| AI Integration | AWS Labs SageMaker MCP server |
 
 ---
 
