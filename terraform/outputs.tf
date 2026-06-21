@@ -1,29 +1,19 @@
-output "lambda_function_name" {
-  description = "Name of the Lambda function"
-  value       = aws_lambda_function.cost_analyzer.function_name
-}
-
-output "lambda_function_arn" {
-  description = "ARN of the Lambda function"
-  value       = aws_lambda_function.cost_analyzer.arn
-}
-
-output "s3_bucket_name" {
-  description = "Name of the S3 bucket for reports"
-  value       = aws_s3_bucket.cost_reports.id
-}
-
-output "s3_bucket_arn" {
-  description = "ARN of the S3 bucket"
-  value       = aws_s3_bucket.cost_reports.arn
-}
-
 output "sns_topic_arn" {
-  description = "ARN of the SNS topic for cost analysis notifications"
-  value       = aws_sns_topic.cost_analysis_notifications.arn
+  description = "ARN du topic SNS"
+  value       = aws_sns_topic.notifications.arn
+}
+
+output "lambda_function_name" {
+  description = "Nom de la Lambda guardrail"
+  value       = aws_lambda_function.guardrail.function_name
 }
 
 output "eventbridge_rule_name" {
-  description = "Name of the EventBridge rule"
-  value       = aws_cloudwatch_event_rule.ml_cost_analysis_schedule.name
+  description = "Nom de la règle EventBridge"
+  value       = aws_cloudwatch_event_rule.schedule.name
+}
+
+output "budget_name" {
+  description = "Nom du budget AWS"
+  value       = aws_budgets_budget.sagemaker.name
 }
