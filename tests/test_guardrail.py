@@ -2,244 +2,373 @@ import os
 import sys
 from unittest import mock
 
+import pytest
 from botocore.exceptions import ClientError
 
 os.environ["AWS_REGION"] = "eu-west-1"
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "../lambda"))
 
-from guardrail import (
-    get_cost,
+import guardrail  # noqa: E402
+from guardrail import (  # noqa: E402
+    HOURS_PER_MONTH,
+    estimate_monthly_cost,
+    get_endpoint_instances,
     handle_resource,
     handler,
     is_idle,
 )
 
-# ── get_cost ──────────────────────────────────────────────────────────────────
+
+def _client_error(op="Op", code="AccessDenied"):
+    return ClientError({"Error": {"Code": code, "Message": ""}}, op)
 
 
-class TestGetCost:
-    def test_known_instance_type(self):
-        assert get_cost({"instance_type": "ml.t3.medium"}) == round(0.05 * 730, 2)
-
-    def test_unknown_instance_type_uses_fallback(self):
-        assert get_cost({"instance_type": "ml.unknown"}) == round(0.10 * 730, 2)
-
-    def test_missing_instance_type_uses_fallback(self):
-        assert get_cost({}) == round(0.10 * 730, 2)
+def _resource(tags, kind="notebook", instance_type="ml.t3.xlarge", instances=None):
+    r = {"name": "test-res", "kind": kind, "arn": "arn:test", "tags": tags}
+    if kind == "notebook":
+        r["instance_type"] = instance_type
+    else:
+        r["instances"] = instances if instances is not None else [("ml.m5.xlarge", 1)]
+    return r
 
 
-# ── is_idle ───────────────────────────────────────────────────────────────────
+@pytest.fixture
+def live(monkeypatch):
+    """Disable dry-run so stop calls actually reach the (mocked) client."""
+    monkeypatch.setattr(guardrail, "DRY_RUN", False)
+
+
+@pytest.fixture
+def sns_topic(monkeypatch):
+    monkeypatch.setattr(guardrail, "SNS_TOPIC_ARN", "arn:aws:sns:eu-west-1:123:t")
+
+
+# ── cost estimate ─────────────────────────────────────────────────────────────
+
+
+class TestEstimateMonthlyCost:
+    def test_known_notebook_type(self):
+        cost, reliable = estimate_monthly_cost({"instance_type": "ml.t3.medium"})
+        assert cost == round(0.05 * HOURS_PER_MONTH, 2) and reliable
+
+    def test_unknown_type_uses_fallback_and_is_flagged(self):
+        cost, reliable = estimate_monthly_cost({"instance_type": "ml.future.9xl"})
+        assert cost == round(0.10 * HOURS_PER_MONTH, 2) and not reliable
+
+    def test_endpoint_sums_variants_times_count(self):
+        cost, _ = estimate_monthly_cost(
+            {"instances": [("ml.m5.xlarge", 2), ("ml.t3.medium", 1)]}
+        )
+        assert cost == round((0.25 * 2 + 0.05) * HOURS_PER_MONTH, 2)
+
+    def test_serverless_variant_costs_nothing(self):
+        cost, reliable = estimate_monthly_cost({"instances": [("serverless", 0)]})
+        assert cost == 0.0 and reliable
+
+    def test_endpoint_without_config_falls_back(self):
+        # describe failed → instances == [] → fallback single unknown instance
+        cost, reliable = estimate_monthly_cost({"instances": []})
+        assert cost == round(0.10 * HOURS_PER_MONTH, 2) and not reliable
+
+
+class TestGetEndpointInstances:
+    def test_reads_variants_from_config(self):
+        sm = mock.MagicMock()
+        sm.describe_endpoint.return_value = {"EndpointConfigName": "cfg"}
+        sm.describe_endpoint_config.return_value = {
+            "ProductionVariants": [
+                {"InstanceType": "ml.m5.xlarge", "InitialInstanceCount": 2},
+                {"ServerlessConfig": {"MemorySizeInMB": 2048}},
+            ]
+        }
+        with mock.patch("guardrail.sm", sm):
+            assert get_endpoint_instances("ep") == [
+                ("ml.m5.xlarge", 2),
+                ("serverless", 0),
+            ]
+
+    def test_describe_error_returns_empty(self):
+        sm = mock.MagicMock()
+        sm.describe_endpoint.side_effect = _client_error("DescribeEndpoint")
+        with mock.patch("guardrail.sm", sm):
+            assert get_endpoint_instances("ep") == []
+
+
+# ── idle detection ────────────────────────────────────────────────────────────
 
 
 class TestIsIdle:
-    def _mock_cw(self, datapoints):
+    def _cw(self, datapoints):
         cw = mock.MagicMock()
         cw.get_metric_statistics.return_value = {"Datapoints": datapoints}
         return cw
 
     def test_notebook_idle_when_low_cpu(self):
-        with mock.patch("guardrail.cw", self._mock_cw([{"Average": 1.0}])):
+        with mock.patch("guardrail.cw", self._cw([{"Average": 1.0}])):
             assert is_idle({"name": "nb", "kind": "notebook"}) is True
 
     def test_notebook_active_when_high_cpu(self):
-        with mock.patch("guardrail.cw", self._mock_cw([{"Average": 80.0}])):
+        with mock.patch("guardrail.cw", self._cw([{"Average": 80.0}])):
             assert is_idle({"name": "nb", "kind": "notebook"}) is False
 
     def test_notebook_idle_when_no_datapoints(self):
-        with mock.patch("guardrail.cw", self._mock_cw([])):
+        with mock.patch("guardrail.cw", self._cw([])):
             assert is_idle({"name": "nb", "kind": "notebook"}) is True
 
+    def test_notebook_queries_notebook_namespace(self):
+        cw = self._cw([])
+        with mock.patch("guardrail.cw", cw):
+            is_idle({"name": "nb", "kind": "notebook"})
+        assert (
+            cw.get_metric_statistics.call_args.kwargs["Namespace"]
+            == "/aws/sagemaker/NotebookInstances"
+        )
+
     def test_endpoint_idle_when_zero_invocations(self):
-        with mock.patch("guardrail.cw", self._mock_cw([])):
+        with mock.patch("guardrail.cw", self._cw([])):
             assert is_idle({"name": "ep", "kind": "endpoint"}) is True
 
     def test_endpoint_active_when_invocations_present(self):
-        with mock.patch("guardrail.cw", self._mock_cw([{"Sum": 100.0}])):
+        with mock.patch("guardrail.cw", self._cw([{"Sum": 100.0}])):
             assert is_idle({"name": "ep", "kind": "endpoint"}) is False
 
-    def test_returns_false_on_client_error(self):
+    def test_endpoint_query_includes_variant_dimension(self):
+        cw = self._cw([])
+        with mock.patch("guardrail.cw", cw):
+            is_idle({"name": "ep", "kind": "endpoint"})
+        dims = cw.get_metric_statistics.call_args.kwargs["Dimensions"]
+        assert {"Name": "VariantName", "Value": "AllTraffic"} in dims
+
+    def test_client_error_means_not_idle(self):
         cw = mock.MagicMock()
-        cw.get_metric_statistics.side_effect = ClientError(
-            {"Error": {"Code": "AccessDenied", "Message": ""}}, "GetMetricStatistics"
-        )
+        cw.get_metric_statistics.side_effect = _client_error("GetMetricStatistics")
         with mock.patch("guardrail.cw", cw):
             assert is_idle({"name": "nb", "kind": "notebook"}) is False
 
+    def test_unknown_kind_not_idle(self):
+        with mock.patch("guardrail.cw", self._cw([])):
+            assert is_idle({"name": "x", "kind": "training-job"}) is False
 
-# ── handle_resource ───────────────────────────────────────────────────────────
+
+# ── policy ────────────────────────────────────────────────────────────────────
 
 
-class TestHandleResource:
-    def _resource(self, tags, kind="notebook", instance_type="ml.t3.medium"):
-        return {
-            "name": "test-res",
-            "kind": kind,
-            "arn": "arn:test",
-            "instance_type": instance_type,
-            "tags": tags,
-        }
-
-    # Case 1 — HIGH CRITICALITY
-    def test_case1_high_criticality_notify_only(self):
+class TestPolicy:
+    def test_critical_notifies_and_never_stops(self, live, sns_topic):
+        sm, sns = mock.MagicMock(), mock.MagicMock()
         with (
-            mock.patch("guardrail.notify_only") as m_notify,
+            mock.patch("guardrail.sm", sm),
+            mock.patch("guardrail.sns", sns),
             mock.patch("guardrail.is_idle", return_value=True),
-            mock.patch("guardrail.get_cost", return_value=200.0),
         ):
-            handle_resource(self._resource({"DataCriticality": "high"}))
-        m_notify.assert_called_once()
+            assert (
+                handle_resource(
+                    _resource({"DataCriticality": "high", "AutoStop": "true"})
+                )
+                == "notify_critical"
+            )
+        sm.stop_notebook_instance.assert_not_called()
+        sns.publish.assert_called_once()
 
-    def test_case1_does_not_stop(self):
+    def test_prod_above_threshold_escalates(self, live, sns_topic):
+        sns = mock.MagicMock()
+        with mock.patch("guardrail.sns", sns):
+            assert (
+                handle_resource(
+                    _resource({"Environment": "prod"}, instance_type="ml.p3.2xlarge")
+                )
+                == "escalate_prod"
+            )
+        assert "above threshold" in sns.publish.call_args.kwargs["Subject"]
+
+    def test_prod_below_threshold_is_silent(self, live, sns_topic):
+        sns = mock.MagicMock()
+        with mock.patch("guardrail.sns", sns):
+            assert (
+                handle_resource(
+                    _resource({"Environment": "prod"}, instance_type="ml.t3.medium")
+                )
+                == "prod_ok"
+            )
+        sns.publish.assert_not_called()
+
+    def test_prod_never_auto_stops_even_with_autostop_tag(self, live, sns_topic):
+        sm = mock.MagicMock()
         with (
-            mock.patch("guardrail.stop_resource") as m_stop,
-            mock.patch("guardrail.notify_only"),
+            mock.patch("guardrail.sm", sm),
             mock.patch("guardrail.is_idle", return_value=True),
-            mock.patch("guardrail.get_cost", return_value=200.0),
         ):
-            handle_resource(self._resource({"DataCriticality": "high"}))
-        m_stop.assert_not_called()
+            handle_resource(
+                _resource(
+                    {"Environment": "prod", "AutoStop": "true"},
+                    instance_type="ml.t3.medium",
+                )
+            )
+        sm.stop_notebook_instance.assert_not_called()
 
-    # Case 2 — PROD
-    def test_case2_prod_no_stop(self):
+    def test_autostop_idle_notebook_is_stopped(self, live, sns_topic):
+        sm, sns = mock.MagicMock(), mock.MagicMock()
         with (
-            mock.patch("guardrail.stop_resource") as m_stop,
+            mock.patch("guardrail.sm", sm),
+            mock.patch("guardrail.sns", sns),
             mock.patch("guardrail.is_idle", return_value=True),
-            mock.patch("guardrail.get_cost", return_value=200.0),
         ):
-            handle_resource(self._resource({"Environment": "prod"}))
-        m_stop.assert_not_called()
+            assert handle_resource(_resource({"AutoStop": "true"})) == "stopped"
+        sm.stop_notebook_instance.assert_called_once_with(
+            NotebookInstanceName="test-res"
+        )
+        assert "stopped" in sns.publish.call_args.kwargs["Subject"]
 
-    def test_case2_prod_high_cost_escalates(self):
+    def test_dry_run_does_not_stop_but_reports(self, sns_topic):
+        # DRY_RUN is the module default (env unset → true)
+        sm, sns = mock.MagicMock(), mock.MagicMock()
         with (
-            mock.patch("guardrail.alert_escalation") as m_esc,
+            mock.patch("guardrail.sm", sm),
+            mock.patch("guardrail.sns", sns),
             mock.patch("guardrail.is_idle", return_value=True),
-            mock.patch("guardrail.get_cost", return_value=200.0),
         ):
-            handle_resource(self._resource({"Environment": "prod"}))
-        m_esc.assert_called_once()
+            assert handle_resource(_resource({"AutoStop": "true"})) == "stop_skipped"
+        sm.stop_notebook_instance.assert_not_called()
+        assert sns.publish.call_args.kwargs["Subject"].startswith("[DRY_RUN]")
 
-    def test_case2_prod_low_cost_no_escalation(self):
+    def test_autostop_active_notebook_is_left_alone(self, live, sns_topic):
+        sm, sns = mock.MagicMock(), mock.MagicMock()
         with (
-            mock.patch("guardrail.alert_escalation") as m_esc,
-            mock.patch("guardrail.is_idle", return_value=True),
-            mock.patch("guardrail.get_cost", return_value=5.0),
-        ):
-            handle_resource(self._resource({"Environment": "prod"}))
-        m_esc.assert_not_called()
-
-    # Case 3 — SAFE AUTO STOP
-    def test_case3_dev_autostop_idle_above_threshold_stops(self):
-        with (
-            mock.patch("guardrail.stop_resource") as m_stop,
-            mock.patch("guardrail.notify_slack"),
-            mock.patch("guardrail.is_idle", return_value=True),
-            mock.patch("guardrail.get_cost", return_value=50.0),
-        ):
-            handle_resource(self._resource({"AutoStop": "true", "Environment": "dev"}))
-        m_stop.assert_called_once()
-
-    def test_case3_no_stop_if_not_idle(self):
-        with (
-            mock.patch("guardrail.stop_resource") as m_stop,
-            mock.patch("guardrail.notify_slack"),
+            mock.patch("guardrail.sm", sm),
+            mock.patch("guardrail.sns", sns),
             mock.patch("guardrail.is_idle", return_value=False),
-            mock.patch("guardrail.get_cost", return_value=50.0),
         ):
-            handle_resource(self._resource({"AutoStop": "true", "Environment": "dev"}))
-        m_stop.assert_not_called()
+            assert handle_resource(_resource({"AutoStop": "true"})) == "monitor"
+        sm.stop_notebook_instance.assert_not_called()
+        sns.publish.assert_not_called()
 
-    def test_case3_no_stop_if_cost_below_threshold(self):
+    def test_autostop_cheap_notebook_is_not_checked(self, live, sns_topic):
+        # cost below IDLE_COST_THRESHOLD → is_idle never even called (saves CloudWatch calls)
         with (
-            mock.patch("guardrail.stop_resource") as m_stop,
-            mock.patch("guardrail.notify_slack"),
+            mock.patch("guardrail.is_idle") as idle,
+            mock.patch("guardrail.IDLE_COST_THRESHOLD", 1000),
+        ):
+            assert handle_resource(_resource({"AutoStop": "true"})) == "monitor"
+        idle.assert_not_called()
+
+    def test_idle_endpoint_is_notified_not_deleted(self, live, sns_topic):
+        sm, sns = mock.MagicMock(), mock.MagicMock()
+        with (
+            mock.patch("guardrail.sm", sm),
+            mock.patch("guardrail.sns", sns),
             mock.patch("guardrail.is_idle", return_value=True),
-            mock.patch("guardrail.get_cost", return_value=1.0),
         ):
-            handle_resource(self._resource({"AutoStop": "true", "Environment": "dev"}))
-        m_stop.assert_not_called()
+            assert (
+                handle_resource(_resource({"AutoStop": "true"}, kind="endpoint"))
+                == "notify_idle_endpoint"
+            )
+        sm.delete_endpoint.assert_not_called()
+        sm.stop_notebook_instance.assert_not_called()
+        assert "Idle endpoint" in sns.publish.call_args.kwargs["Subject"]
 
-    # Case 4 — DEFAULT
-    def test_case4_default_monitoring_only(self):
-        with (
-            mock.patch("guardrail.notify_slack") as m_slack,
-            mock.patch("guardrail.is_idle", return_value=False),
-            mock.patch("guardrail.get_cost", return_value=20.0),
-        ):
-            handle_resource(self._resource({}))
-        m_slack.assert_called_once_with(mock.ANY, action="monitoring only")
+    def test_default_is_log_only(self, live, sns_topic):
+        sns = mock.MagicMock()
+        with mock.patch("guardrail.sns", sns):
+            assert handle_resource(_resource({})) == "monitor"
+        sns.publish.assert_not_called()
+
+    def test_unknown_instance_type_is_flagged_in_message(self, live, sns_topic):
+        sns = mock.MagicMock()
+        with mock.patch("guardrail.sns", sns):
+            handle_resource(
+                _resource({"DataCriticality": "high"}, instance_type="ml.new.type")
+            )
+        assert "fallback price" in sns.publish.call_args.kwargs["Message"]
+
+    def test_notify_without_topic_is_noop(self, monkeypatch):
+        monkeypatch.setattr(guardrail, "SNS_TOPIC_ARN", None)
+        sns = mock.MagicMock()
+        with mock.patch("guardrail.sns", sns):
+            handle_resource(_resource({"DataCriticality": "high"}))
+        sns.publish.assert_not_called()
 
 
 # ── handler ───────────────────────────────────────────────────────────────────
 
 
 class TestHandler:
-    def _make_sm(self, notebooks=None, endpoints=None):
+    def _sm(self, notebooks=(), endpoints=()):
         sm = mock.MagicMock()
 
-        def paginator_side_effect(name):
+        def paginator(op):
             p = mock.MagicMock()
-            if name == "list_notebook_instances":
-                p.paginate.return_value = [{"NotebookInstances": notebooks or []}]
-            elif name == "list_endpoints":
-                p.paginate.return_value = [{"Endpoints": endpoints or []}]
+            key = (
+                "NotebookInstances" if op == "list_notebook_instances" else "Endpoints"
+            )
+            p.paginate.return_value = [
+                {key: list(notebooks if key == "NotebookInstances" else endpoints)}
+            ]
             return p
 
-        sm.get_paginator.side_effect = paginator_side_effect
+        sm.get_paginator.side_effect = paginator
         sm.list_tags.return_value = {"Tags": []}
+        sm.describe_endpoint.return_value = {"EndpointConfigName": "cfg"}
+        sm.describe_endpoint_config.return_value = {
+            "ProductionVariants": [
+                {"InstanceType": "ml.m5.xlarge", "InitialInstanceCount": 1}
+            ]
+        }
         return sm
 
-    def test_returns_200(self):
-        sm = self._make_sm()
-        with mock.patch("guardrail.sm", sm):
-            assert handler({}, None) == {"statusCode": 200}
-
-    def test_calls_handle_resource_for_each_active_notebook(self):
-        sm = self._make_sm(
+    def test_skips_resources_not_in_service(self):
+        sm = self._sm(
             notebooks=[
                 {
-                    "NotebookInstanceName": "nb-1",
-                    "NotebookInstanceArn": "arn:1",
-                    "NotebookInstanceStatus": "InService",
-                    "InstanceType": "ml.t3.medium",
-                },
-                {
-                    "NotebookInstanceName": "nb-2",
-                    "NotebookInstanceArn": "arn:2",
-                    "NotebookInstanceStatus": "InService",
-                    "InstanceType": "ml.t3.medium",
-                },
-            ]
-        )
-        with (
-            mock.patch("guardrail.sm", sm),
-            mock.patch("guardrail.handle_resource") as m_handle,
-        ):
-            handler({}, None)
-        assert m_handle.call_count == 2
-
-    def test_skips_stopped_resources(self):
-        sm = self._make_sm(
-            notebooks=[
-                {
-                    "NotebookInstanceName": "nb-stopped",
-                    "NotebookInstanceArn": "arn:1",
+                    "NotebookInstanceName": "a",
                     "NotebookInstanceStatus": "Stopped",
+                    "NotebookInstanceArn": "arn:a",
+                },
+                {
+                    "NotebookInstanceName": "b",
+                    "NotebookInstanceStatus": "InService",
+                    "NotebookInstanceArn": "arn:b",
                     "InstanceType": "ml.t3.medium",
                 },
+            ],
+            endpoints=[
+                {
+                    "EndpointName": "e",
+                    "EndpointStatus": "Creating",
+                    "EndpointArn": "arn:e",
+                }
+            ],
+        )
+        with (
+            mock.patch("guardrail.sm", sm),
+            mock.patch("guardrail.handle_resource", return_value="monitor") as hr,
+        ):
+            result = handler({}, None)
+        assert hr.call_count == 1
+        assert result == {
+            "statusCode": 200,
+            "dry_run": True,
+            "decisions": {"monitor": 1},
+        }
+
+    def test_endpoint_instances_are_collected(self):
+        sm = self._sm(
+            endpoints=[
+                {
+                    "EndpointName": "e",
+                    "EndpointStatus": "InService",
+                    "EndpointArn": "arn:e",
+                }
             ]
         )
         with (
             mock.patch("guardrail.sm", sm),
-            mock.patch("guardrail.handle_resource") as m_handle,
+            mock.patch("guardrail.handle_resource", return_value="monitor") as hr,
         ):
             handler({}, None)
-        m_handle.assert_not_called()
+        assert hr.call_args.args[0]["instances"] == [("ml.m5.xlarge", 1)]
 
-    def test_does_not_crash_on_sagemaker_error(self):
+    def test_listing_error_does_not_crash(self):
         sm = mock.MagicMock()
-        sm.get_paginator.side_effect = ClientError(
-            {"Error": {"Code": "AccessDenied", "Message": ""}}, "ListNotebookInstances"
-        )
+        sm.get_paginator.side_effect = _client_error("ListNotebookInstances")
         with mock.patch("guardrail.sm", sm):
-            result = handler({}, None)
-        assert result["statusCode"] == 200
+            assert handler({}, None)["statusCode"] == 200

@@ -24,9 +24,9 @@ resource "aws_iam_role_policy" "lambda_policy" {
     Version = "2012-10-17"
     Statement = [
       {
-        Sid    = "Logs"
-        Effect = "Allow"
-        Action = ["logs:CreateLogGroup", "logs:CreateLogStream", "logs:PutLogEvents"]
+        Sid      = "Logs"
+        Effect   = "Allow"
+        Action   = ["logs:CreateLogGroup", "logs:CreateLogStream", "logs:PutLogEvents"]
         Resource = "arn:aws:logs:*:*:*"
       },
       {
@@ -36,14 +36,16 @@ resource "aws_iam_role_policy" "lambda_policy" {
           "sagemaker:ListNotebookInstances",
           "sagemaker:ListEndpoints",
           "sagemaker:ListTags",
+          "sagemaker:DescribeEndpoint",
+          "sagemaker:DescribeEndpointConfig",
           "sagemaker:StopNotebookInstance"
         ]
         Resource = "*"
       },
       {
-        Sid    = "CloudWatch"
-        Effect = "Allow"
-        Action = ["cloudwatch:GetMetricStatistics"]
+        Sid      = "CloudWatch"
+        Effect   = "Allow"
+        Action   = ["cloudwatch:GetMetricStatistics"]
         Resource = "*"
       },
       {

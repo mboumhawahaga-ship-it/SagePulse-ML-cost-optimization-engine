@@ -119,7 +119,7 @@ cd "$LAMBDA_DIR"
 # Installer les dépendances dans un dossier temporaire
 rm -rf package/
 pip install -r requirements.txt -t package/ -q
-cp main.py discovery.py action.py package/
+cp guardrail.py package/
 cd package && zip -r ../function.zip . -x "*.pyc" -x "*/__pycache__/*" > /dev/null
 cd ..
 rm -rf package/

@@ -28,6 +28,30 @@ variable "high_threshold" {
   default     = 50
 }
 
+variable "dry_run" {
+  description = "When true the Lambda reports every decision but never stops anything"
+  type        = bool
+  default     = true
+}
+
+variable "idle_window_hours" {
+  description = "Look-back window (hours) for CloudWatch idle detection"
+  type        = number
+  default     = 24
+}
+
+variable "log_retention_days" {
+  description = "Retention of the Lambda log group"
+  type        = number
+  default     = 14
+}
+
+variable "github_repository" {
+  description = "GitHub repository allowed to assume the deploy role via OIDC (owner/name)"
+  type        = string
+  default     = "mboumhawahaga-ship-it/SagePulse-ML-cost-optimization-engine"
+}
+
 variable "idle_cost_threshold" {
   description = "Minimum monthly cost (USD) for a dev idle resource to be auto-stopped"
   type        = number

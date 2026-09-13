@@ -1,176 +1,109 @@
-# SagePulse - SageMaker Cost Guardrails Engine
+# SagePulse — SageMaker cost guardrails
 
-## Overview
+A scheduled Lambda that finds idle SageMaker notebooks and endpoints, estimates what they cost, and applies a small tag-based policy: stop what is clearly disposable, escalate what is expensive in production, never touch what is critical. Terraform, Python 3.12, 31 tests, GitHub Actions with OIDC.
 
-SagePulse is a serverless FinOps automation platform designed to continuously monitor Amazon SageMaker resources and enforce cost optimization guardrails.
+Every number in this README can be checked in the repository.
 
-The platform automatically detects idle notebooks and inference endpoints, evaluates resource criticality using business tags, and either stops non-critical workloads or escalates alerts for production systems.
+---
 
-Built with AWS serverless services and Infrastructure as Code, SagePulse helps organizations reduce unnecessary ML infrastructure spending while preserving production reliability.
+## The problem
 
-## Business Problem
+SageMaker notebooks are billed while they are *running*, not while someone is using them. A data scientist opens an `ml.t3.xlarge` on Monday, forgets it, and it bills 730 hours a month at roughly $0.20/hour — about $146 for nothing. Inference endpoints are worse: an `ml.m5.xlarge` endpoint that nobody calls still runs 24/7 at about $180/month, and a forgotten `ml.p3.2xlarge` at about $3,000.
 
-Machine learning environments often accumulate idle notebooks and underutilized endpoints that remain active for days or weeks.
+Nobody sees this on the bill because SageMaker shows up as one line. And a generic "stop everything idle" script is dangerous: it will stop the production endpoint or the notebook holding a regulated dataset.
 
-Engineering teams frequently lack automated governance mechanisms to distinguish between critical production assets and disposable development environments, resulting in avoidable cloud spend.
+## The goal
 
-SagePulse addresses this challenge by introducing automated FinOps guardrails for SageMaker workloads.
+1. Every four hours, list in-service notebooks and endpoints.
+2. Estimate each one's monthly cost from its instance type (endpoints: per variant × instance count).
+3. Check CloudWatch for activity: notebook CPU over 24 h, endpoint invocations over 24 h.
+4. Decide with tags, not guesses:
 
-## Key Features
+| Tags on the resource | Idle? | Est. cost | Decision |
+|---|---|---|---|
+| `DataCriticality=high` | — | — | notify, never touch |
+| `Environment=prod` | — | > `HIGH_THRESHOLD` (50 $/mo) | escalation email |
+| `Environment=prod` | — | ≤ threshold | silent |
+| `AutoStop=true` (notebook) | yes | > `IDLE_COST_THRESHOLD` (10 $/mo) | **stop** + email |
+| `AutoStop=true` (endpoint) | yes | > threshold | email "idle endpoint" — endpoints are never deleted automatically |
+| anything else | — | — | log line only, no email |
 
-* Automated idle notebook detection using CloudWatch CPU metrics.
-* Automated idle endpoint detection based on invocation activity.
-* Tag-based business criticality classification.
-* Automatic shutdown of non-critical idle resources.
-* Escalation workflow for production workloads.
-* Budget monitoring with actual and forecasted thresholds.
-* Fully configurable cost and utilization thresholds.
-* Secure CI/CD pipeline using GitHub OIDC authentication.
-* Infrastructure provisioning with Terraform.
+5. Ship with `DRY_RUN=true`: every decision is logged and emailed with a `[DRY_RUN]` prefix, nothing is stopped, until an operator flips the variable.
+
+Auto-stop is **opt-in** (`AutoStop=true`) and restricted to notebooks. The default behaviour of the platform on a resource it knows nothing about is to do nothing and say nothing. That is deliberate: the previous version emailed "monitoring only" for every resource every four hours, and people stopped reading.
+
+## What is implemented
+
+| Component | Where | Notes |
+|---|---|---|
+| Guardrail Lambda | `lambda/guardrail.py` (≈300 lines) | boto3 + Lambda Powertools logger |
+| Cost estimate | `estimate_monthly_cost()` | 15 instance types priced (eu-west-1 on-demand, rounded); unknown types use a $0.10/h fallback and are flagged in the email |
+| Endpoint sizing | `get_endpoint_instances()` | reads `DescribeEndpointConfig` variants; serverless variants cost 0 |
+| Idle detection | `is_idle()` | notebook CPU from `/aws/sagemaker/NotebookInstances`, endpoint `Invocations` with `VariantName=AllTraffic`; any CloudWatch error → "not idle" (fail safe) |
+| Schedule | `terraform/eventbridge.tf` | `rate(4 hours)` |
+| Budget | `terraform/budgets.tf` | AWS Budgets on the SageMaker service: 80 % actual and 100 % forecast → SNS |
+| Notifications | SNS email | one topic, shared by the Lambda and the budget |
+| IAM | `terraform/iam.tf` | one role for the Lambda: list/describe/tags on SageMaker, `StopNotebookInstance`, `GetMetricStatistics`, `sns:Publish` on the one topic |
+| CI/CD | `.github/workflows/ci.yml` | ruff → pytest (coverage gate 85 %, currently 94 %) → terraform fmt/validate → Checkov (soft fail) → build zip → on `main`: `update-function-code` via OIDC |
+| Deploy role | `terraform/oidc.tf` | GitHub OIDC, scoped to `lambda:UpdateFunctionCode` on the one function, `sub` pinned to this repo's `main` |
+
+Not implemented: rightsizing recommendations, Studio apps / training jobs, Slack, multi-account, real billing data (the estimate is a price table, not Cost Explorer). See roadmap.
 
 ## Architecture
 
-EventBridge triggers the guardrail engine every four hours.
-
-The Lambda function:
-
-1. Discovers active SageMaker notebooks and endpoints.
-2. Retrieves CloudWatch utilization metrics.
-3. Evaluates business tags and cost thresholds.
-4. Applies automated remediation or escalation policies.
-5. Publishes notifications through SNS.
-
 ```
-AWS Budgets (monthly thresholds)
-        │
-        ▼
-      SNS Topic ◄─────────────────────────────────┐
-                                                   │
-EventBridge (rate 4h)                              │
-        │                                          │
-        ▼                                          │
-Lambda guardrail.py                                │
-  ├── SageMaker API (notebooks + endpoints)        │
-  ├── CloudWatch (CPU / Invocations)               │
-  ├── DataCriticality=high  → notify only ─────────┤
-  ├── Environment=prod      → escalate if cost > threshold
-  ├── AutoStop=true + idle  → auto-stop + notify ──┤
-  └── default               → monitoring only ─────┘
+AWS Budgets (SageMaker, monthly) ──► SNS ◄────────────────────────────────┐
+                                                                            │
+EventBridge rate(4h) ──► Lambda guardrail                                   │
+                            ├─ ListNotebookInstances / ListEndpoints         │
+                            ├─ DescribeEndpointConfig (variants × count)     │
+                            ├─ ListTags                                      │
+                            ├─ CloudWatch GetMetricStatistics (24 h)         │
+                            ├─ policy → stop notebook (if !DRY_RUN) ─────────┤
+                            └─ policy → notify ──────────────────────────────┘
 ```
 
-The entire platform operates using a fully serverless architecture.
-
-## AWS Services
-
-* AWS Lambda
-* Amazon EventBridge
-* Amazon SNS
-* AWS Budgets
-* Amazon SageMaker
-* Amazon CloudWatch
-* AWS IAM
-* Amazon S3
-* Amazon DynamoDB
-* AWS STS (OIDC federation)
-
-## Guardrail Logic
-
-| Condition | Action |
-|---|---|
-| `DataCriticality=high` | Notify only — no action |
-| `Environment=prod` + cost > threshold | Escalation alert |
-| `Environment=prod` + cost ≤ threshold | No action |
-| `AutoStop=true` + idle + cost > threshold | Auto-stop + notify |
-| Default | Monitoring only |
-
-## FinOps Capabilities
-
-| Capability | Status |
-|---|---|
-| Idle resource detection | ✓ |
-| Automated remediation | ✓ |
-| Budget governance | ✓ |
-| Forecast-based alerting | ✓ |
-| Cost guardrails | ✓ |
-| Rightsizing recommendations | Planned |
-| Cost anomaly detection | Planned |
-
-## Estimated Business Impact
-
-The following figures are conservative estimates based on FinOps Foundation practices and common cloud optimization initiatives.
-
-* Estimated 15-35% reduction in SageMaker development environment costs through automated idle resource shutdown.
-* Estimated 10-25% reduction in endpoint waste by identifying unused inference endpoints.
-* Estimated 20-50% faster detection of budget overruns through automated budget alerts and escalations.
-* Platform operational cost estimated below $1/month for small and medium environments due to the serverless architecture.
-
-### Example Savings Scenario
-
-For an organization spending $10,000/month on SageMaker:
-
-* Potential savings from idle resource management: $1,500–$3,500/month.
-* Potential savings from unused endpoint detection: $1,000–$2,500/month.
-* Total estimated optimization opportunity: $2,500–$6,000/month.
-
-## Configuration
-
-Thresholds are configurable via `terraform.tfvars` without modifying any code.
-
-| Variable | Default | Description |
-|---|---|---|
-| `budget_limit_usd` | `100` | Monthly SageMaker budget limit |
-| `high_threshold` | `50` | Cost threshold (USD/mo) for prod escalation |
-| `idle_cost_threshold` | `10` | Minimum cost (USD/mo) to trigger auto-stop |
-
-## DevOps & Security
-
-* GitHub Actions CI/CD pipeline.
-* Terraform Infrastructure as Code.
-* OIDC federation with AWS (no long-lived credentials).
-* Automated linting, testing and security scanning.
-* Least-privilege IAM model.
-* Secrets detection through pre-commit hooks.
-
-### CI/CD Pipeline
-
-```
-lint (ruff) → test (pytest, coverage ≥ 80%) → build (function.zip)
-                                                      │
-                              security (Checkov IaC) ─┘
-                                                      │
-                                            deploy (main only)
-                                       Terraform via OIDC
-```
-
-## Getting Started
+## Run it
 
 ```bash
-# 1. Bootstrap remote state (one-time)
+# tests
+pip install -r requirements.txt -r requirements-dev.txt -r lambda/requirements.txt
+AWS_REGION=eu-west-1 pytest tests/ --cov=lambda
+
+# one-time bootstrap of remote state (bucket and lock table names are in terraform/main.tf)
 aws s3 mb s3://ml-cost-optimizer-tfstate --region eu-west-1
 aws dynamodb create-table --table-name ml-cost-optimizer-tflock \
   --attribute-definitions AttributeName=LockID,AttributeType=S \
-  --key-schema AttributeName=LockID,KeyType=HASH \
-  --billing-mode PAY_PER_REQUEST --region eu-west-1
+  --key-schema AttributeName=LockID,KeyType=HASH --billing-mode PAY_PER_REQUEST --region eu-west-1
 
-# 2. Build Lambda
-cd lambda
-pip install -r requirements.txt -t package/
-cp guardrail.py package/
-cd package && zip -r ../function.zip . && cd ../..
-
-# 3. Deploy
-cd terraform
-terraform init
-terraform apply
+# build + deploy (dry-run on)
+cd lambda && pip install -r requirements.txt -t package/ && cp guardrail.py package/ \
+  && (cd package && zip -qr ../function.zip .) && cd ..
+cp terraform/terraform.tfvars.example terraform/terraform.tfvars   # set notification_email
+cd terraform && terraform init && terraform apply
 ```
 
-## Future Improvements
+`setup.sh` does the same steps interactively. After a few `[DRY_RUN]` emails look right, set `dry_run = false` and re-apply. The output `github_deploy_role_arn` goes into the `AWS_DEPLOY_ROLE_ARN` GitHub secret for the CI deploy job.
 
-* Rightsizing recommendations.
-* Cost anomaly detection.
-* Slack and Microsoft Teams integrations.
-* Historical cost analytics dashboard.
-* Multi-account AWS Organizations support.
+Invoking the Lambda by hand returns a decision summary, e.g. `{"statusCode": 200, "dry_run": true, "decisions": {"monitor": 6, "stop_skipped": 2, "escalate_prod": 1}}`.
+
+## Known limits
+
+- The cost figure is an on-demand price table × 730 h, not the bill. Savings Plans, spot and regional price differences are not reflected. The email says when a fallback price was used.
+- A notebook with no CloudWatch datapoints in 24 h is treated as idle. That is correct for a running-but-unused instance, and also what you get for the first hour after a start; the cost threshold and the `AutoStop` opt-in keep that from mattering.
+- Only notebook instances and real-time endpoints are covered. Studio apps, training jobs and batch transform are not scanned.
+- Single account, single region.
+
+## Project history
+
+v1 (see `CHANGELOG.md`, kept as an engineering journal) was three Lambdas orchestrated by Step Functions with a human-approval step, Cost Explorer queries, S3 reports and a DynamoDB deduplication table. It produced a nice report and nobody acted on it. v2 replaced it with one Lambda and a policy expressed as tags, because the useful decisions turned out to fit in a five-row table, and the only action worth automating is stopping a dev notebook.
+
+## Roadmap
+
+- Cover SageMaker Studio apps (`ListApps`) and long-running training jobs.
+- Replace the price table with the Pricing API, cached in the Lambda.
+- Optional Slack webhook next to SNS.
+- Per-team weekly digest instead of per-event emails.
 
 ## License
 

@@ -1,4 +1,4 @@
-name: CI/CD Pipeline
+name: CI/CD
 
 on:
   push:
@@ -7,142 +7,102 @@ on:
     branches: [main]
 
 permissions:
-  id-token: write  # OIDC
+  id-token: write # OIDC
   contents: read
 
 jobs:
-
-  # ── Job 1 : Lint ─────────────────────────────
   lint:
-    name: Lint Python
+    name: Lint (ruff)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-          cache: "pip"
+          cache: pip
+      - run: pip install -r requirements-dev.txt
+      - run: ruff check lambda/ tests/
+      - run: ruff format --check lambda/ tests/
 
-      - run: pip install ruff==0.11.9
-
-      - name: Lint & format check
-        run: |
-          ruff check lambda/
-          ruff format lambda/ --check
-
-  # ── Job 2 : Tests ────────────────────────────
   test:
-    name: Tests + Coverage
+    name: Tests + coverage
     runs-on: ubuntu-latest
     needs: lint
     steps:
       - uses: actions/checkout@v4
-
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-          cache: "pip"
-
-      - name: Install dependencies
-        run: |
-          pip install -r requirements.txt
-          pip install -r requirements-dev.txt
-          pip install -r lambda/requirements.txt
-
-      - name: Run tests
+          cache: pip
+      - run: pip install -r requirements.txt -r requirements-dev.txt -r lambda/requirements.txt
+      - run: pytest tests/ --cov=lambda --cov-report=term-missing --cov-fail-under=85
         env:
           AWS_REGION: eu-west-1
-          MOCK_MODE: "true"
-        run: |
-          pytest tests/ \
-            --cov=lambda \
-            --cov-report=term-missing \
-            --cov-report=xml \
-            --cov-fail-under=80 \
-            -v
 
-      - name: Upload coverage to Codecov
-        uses: codecov/codecov-action@v4
-        with:
-          files: ./coverage.xml
-          fail_ci_if_error: false
-
-  # ── Job 3 : Security scan IaC ────────────────
-  security:
-    name: Checkov IaC Scan
+  terraform:
+    name: Terraform fmt + validate
     runs-on: ubuntu-latest
-    needs: lint
     steps:
       - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.9.x"
+      - run: terraform fmt -check -recursive terraform/
+      - working-directory: terraform
+        run: |
+          terraform init -backend=false
+          terraform validate
 
-      - name: Run Checkov
-        uses: bridgecrewio/checkov-action@master
+  security:
+    name: Checkov (IaC)
+    runs-on: ubuntu-latest
+    needs: terraform
+    steps:
+      - uses: actions/checkout@v4
+      - uses: bridgecrewio/checkov-action@v12
         with:
           directory: terraform/
           quiet: true
-          soft_fail: true  # Ne bloque pas le CI — alerte seulement
+          soft_fail: true # reports findings, does not block
 
-  # ── Job 4 : Build Lambda zip ─────────────────
   build:
-    name: Build Lambda
+    name: Build function.zip
     runs-on: ubuntu-latest
     needs: test
     steps:
       - uses: actions/checkout@v4
-
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-
-      - name: Build function.zip
-        run: |
+      - run: |
           cd lambda
           pip install -r requirements.txt -t package/
-          cp main.py discovery.py action.py package/
-          cd package && zip -r ../function.zip . -x "*.pyc" -x "*/__pycache__/*"
-          echo "function.zip size: $(du -sh ../function.zip | cut -f1)"
-
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
+          cp guardrail.py package/
+          cd package && zip -qr ../function.zip . -x "*.pyc" -x "*/__pycache__/*"
+          echo "function.zip: $(du -sh ../function.zip | cut -f1)"
+      - uses: actions/upload-artifact@v4
         with:
           name: lambda-zip
           path: lambda/function.zip
           retention-days: 1
 
-  # ── Job 5 : Deploy Terraform (main only) ─────
   deploy:
-    name: Deploy via Terraform
+    # Ships new Lambda code only. Infrastructure changes are applied by an operator
+    # with `terraform apply`; the OIDC role has no permission to do that.
+    name: Deploy Lambda code (main only)
     runs-on: ubuntu-latest
     needs: [build, security]
     if: github.ref == 'refs/heads/main' && github.event_name == 'push'
     steps:
-      - uses: actions/checkout@v4
-
-      - name: Download Lambda artifact
-        uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v4
         with:
           name: lambda-zip
-          path: lambda/
-
-      - name: Configure AWS credentials (OIDC)
-        uses: aws-actions/configure-aws-credentials@v4
+      - uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
           aws-region: eu-west-1
-
-      - uses: hashicorp/setup-terraform@v3
-        with:
-          terraform_version: "1.7.0"
-
-      - name: Terraform Init
-        working-directory: terraform
-        run: terraform init
-
-      - name: Terraform Plan
-        working-directory: terraform
-        run: terraform plan -var="notification_email=${{ secrets.NOTIFICATION_EMAIL }}"
-
-      - name: Terraform Apply
-        working-directory: terraform
-        run: terraform apply -auto-approve -var="notification_email=${{ secrets.NOTIFICATION_EMAIL }}"
+      - run: |
+          aws lambda update-function-code \
+            --function-name ml-cost-optimizer-guardrail \
+            --zip-file fileb://function.zip \
+            --publish

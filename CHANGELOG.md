@@ -1,5 +1,9 @@
 # Journal de bord
 
+> **Note** : les premières sessions décrivent la v1 (Lambdas `main.py` / `discovery.py` / `action.py`,
+> Step Functions avec approbation humaine, rapports S3, Cost Explorer). La v2 a remplacé tout cela par
+> une seule Lambda `guardrail.py` et une politique par tags — voir README. Le code v1 reste dans l'historique git.
+
 ---
 
 ## Session — Avril 2026
