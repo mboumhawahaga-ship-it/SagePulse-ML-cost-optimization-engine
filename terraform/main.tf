@@ -50,11 +50,15 @@ resource "aws_lambda_function" "guardrail" {
 
   environment {
     variables = {
-      SNS_TOPIC_ARN        = aws_sns_topic.notifications.arn
-      HIGH_THRESHOLD       = tostring(var.high_threshold)
-      IDLE_COST_THRESHOLD  = tostring(var.idle_cost_threshold)
+      SNS_TOPIC_ARN       = aws_sns_topic.notifications.arn
+      DRY_RUN             = var.dry_run ? "true" : "false"
+      HIGH_THRESHOLD      = tostring(var.high_threshold)
+      IDLE_COST_THRESHOLD = tostring(var.idle_cost_threshold)
+      IDLE_WINDOW_HOURS   = tostring(var.idle_window_hours)
     }
   }
+
+  depends_on = [aws_cloudwatch_log_group.guardrail]
 
   tags = {
     Project   = var.project_name
@@ -62,9 +66,10 @@ resource "aws_lambda_function" "guardrail" {
   }
 }
 
+# Created before the Lambda so the retention policy applies from the first invocation.
 resource "aws_cloudwatch_log_group" "guardrail" {
-  name              = "/aws/lambda/${aws_lambda_function.guardrail.function_name}"
-  retention_in_days = 7
+  name              = "/aws/lambda/${var.project_name}-guardrail"
+  retention_in_days = var.log_retention_days
 
   tags = {
     Project   = var.project_name

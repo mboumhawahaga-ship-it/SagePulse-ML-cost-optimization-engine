@@ -3,55 +3,26 @@
 *.tfstate
 *.tfstate.*
 *.tfvars
+!*.tfvars.example
 
-# Lambda
+# Lambda build
 **/function.zip
 **/package/
-**/__pycache__/
+__pycache__/
 *.pyc
 
-# Test coverage
+# Coverage
 .coverage
 coverage.xml
 htmlcov/
+.pytest_cache/
 
-# OS files
-.DS_Store
-Thumbs.db
-desktop.ini
-
-# IDE
+# IDE / OS
 .vscode/
 .idea/
+.DS_Store
+Thumbs.db
 
-# AWS
-.aws/
-
-# MCP (peut contenir des infos sensibles)
-mcp.json
-
-# Claude
+# Tooling
 .claude/
 .claude.json*
-.config/
-
-# Windows system files
-NTUSER.*
-ntuser.*
-AppData/
-Contacts/
-Downloads/
-Favorites/
-Links/
-Music/
-OneDrive/
-Saved Games/
-Searches/
-Videos/
-3D Objects/
-IntelGraphicsProfiles/
-.gitconfig
-.ssh/
-output.json
-out.json
-sagemaker-optimization-report-*.md

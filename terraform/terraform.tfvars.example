@@ -1,0 +1,8 @@
+# Copy to terraform.tfvars (gitignored).
+notification_email  = "you@example.com"
+budget_limit_usd    = "100"
+high_threshold      = 50
+idle_cost_threshold = 10
+idle_window_hours   = 24
+dry_run             = true   # set to false once the dry-run emails look right
+github_repository   = "mboumhawahaga-ship-it/SagePulse-ML-cost-optimization-engine"
